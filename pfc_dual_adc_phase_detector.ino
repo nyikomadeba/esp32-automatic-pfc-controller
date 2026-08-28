@@ -207,6 +207,8 @@ void setup() {
   Serial.println("========================================\n");
 
   // ----- I2C LCD -----
+  // NOTE: The LCD backlight LED is hard-wired always-on via a solder jumper on the module;
+  //       lcd.backlight() is kept here for completeness but has no effect on that hardware.
   Wire.begin();  // SDA = GPIO 21, SCL = GPIO 22 (ESP32 defaults)
   lcd.init();
   lcd.backlight();
@@ -223,11 +225,13 @@ void setup() {
   analogSetPinAttenuation(CURR_PIN_ADC1, ADC_11db);
 
   // ----- Relays & LED -----
+  // Relay modules are ACTIVE-LOW: HIGH = relay OFF (de-energized), LOW = relay ON (energized).
+  // Initialise both relays HIGH so they are OFF at startup.
   pinMode(RELAY_5UF_PIN, OUTPUT);
   pinMode(RELAY_12UF_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(RELAY_5UF_PIN, LOW);
-  digitalWrite(RELAY_12UF_PIN, LOW);
+  digitalWrite(RELAY_5UF_PIN, HIGH);   // OFF at startup (active-low module)
+  digitalWrite(RELAY_12UF_PIN, HIGH);  // OFF at startup (active-low module)
   digitalWrite(LED_PIN, LOW);
 
   // ----- WiFi + Blynk (non-blocking with 10-second timeout) -----
@@ -504,9 +508,10 @@ void autoCorrectPFC() {
 }
 
 // ============= CONTROL RELAYS =============
+// Relay modules are ACTIVE-LOW: LOW energizes the relay (ON), HIGH de-energizes it (OFF).
 void controlRelays() {
-  digitalWrite(RELAY_5UF_PIN, relay_control.relay_5uf ? HIGH : LOW);
-  digitalWrite(RELAY_12UF_PIN, relay_control.relay_12uf ? HIGH : LOW);
+  digitalWrite(RELAY_5UF_PIN,  relay_control.relay_5uf  ? LOW : HIGH);
+  digitalWrite(RELAY_12UF_PIN, relay_control.relay_12uf ? LOW : HIGH);
 }
 
 // ============= UPDATE I2C LCD =============
