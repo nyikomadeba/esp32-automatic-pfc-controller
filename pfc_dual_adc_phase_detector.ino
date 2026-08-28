@@ -98,6 +98,9 @@ struct Sample {
   uint16_t sample_index;  // Position in array (0 to TOTAL_SAMPLES-1)
 };
 
+// Simple enum — avoids error-prone String comparisons everywhere
+enum PhaseType { IN_PHASE, LAGGING, LEADING };
+
 struct WaveformData {
   Sample samples[TOTAL_SAMPLES];
   uint16_t peak_volt_index;
@@ -110,7 +113,7 @@ struct WaveformData {
   float apparent_power;
   float power_factor;
   float phase_angle_deg;
-  String phase_type;  // "LEADING", "LAGGING", or "IN_PHASE"
+  PhaseType phase_type;  // IN_PHASE, LAGGING, or LEADING
 };
 
 struct RelayControl {
@@ -168,17 +171,29 @@ void setup() {
   digitalWrite(RELAY_12UF_PIN, LOW);
   digitalWrite(LED_PIN, LOW);
 
-  // ----- WiFi + Blynk -----
+  // ----- WiFi + Blynk (non-blocking with 10-second timeout) -----
   Serial.print("[SETUP] Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
   lcd.setCursor(0, 1);
   lcd.print("WiFi connect... ");
-  Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
-  Serial.println("[SETUP] WiFi + Blynk connected");
-
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("PFC Ready!");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long wifi_start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifi_start < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.config(BLYNK_AUTH_TOKEN);
+    Blynk.connect(3000);  // 3-second Blynk server connect timeout
+    Serial.println("\n[SETUP] WiFi + Blynk connected");
+    lcd.setCursor(0, 1);
+    lcd.print("Blynk OK!       ");
+  } else {
+    Serial.println("\n[SETUP] WiFi failed — running standalone");
+    lcd.setCursor(0, 1);
+    lcd.print("Standalone mode ");
+  }
+  delay(1000);
 
   Serial.println("[SETUP] ADC configuration complete");
   Serial.print("[SETUP] Capturing ");
@@ -289,13 +304,13 @@ void findPeaks() {
   Serial.print(waveform.peak_volt_index);
   Serial.print(" (time: ");
   Serial.print(waveform.samples[waveform.peak_volt_index].timestamp_us);
-  Serial.println("µs)");
+  Serial.println("us)");
   
   Serial.print("[PEAKS] Current peak at index: ");
   Serial.print(waveform.peak_curr_index);
   Serial.print(" (time: ");
   Serial.print(waveform.samples[waveform.peak_curr_index].timestamp_us);
-  Serial.println("µs)");
+  Serial.println("us)");
 }
 
 // ============= CALCULATE RMS, POWER =============
@@ -351,16 +366,16 @@ void detectPhase() {
   
   // Determine if leading or lagging based on peak index order
   if (index_diff > 0) {
-    waveform.phase_type = "LAGGING";  // Current peaks AFTER voltage
+    waveform.phase_type = LAGGING;   // Current peaks AFTER voltage
   } else if (index_diff < 0) {
-    waveform.phase_type = "LEADING";  // Current peaks BEFORE voltage
+    waveform.phase_type = LEADING;   // Current peaks BEFORE voltage
   } else {
-    waveform.phase_type = "IN_PHASE"; // Peaks aligned
+    waveform.phase_type = IN_PHASE;  // Peaks aligned
   }
   
   // Cross-check: if calculated real power is negative, load is capacitive (leading)
   if (waveform.real_power < 0) {
-    waveform.phase_type = "LEADING";
+    waveform.phase_type = LEADING;
   }
   
   // Phase angle from arccos of |PF| for reference
@@ -370,7 +385,7 @@ void detectPhase() {
   Serial.print(index_diff);
   Serial.print(" | Time difference: ");
   Serial.print(time_diff_us);
-  Serial.println("µs");
+  Serial.println("us");
   Serial.print("[PHASE] Phase angle (from peaks): ");
   Serial.print(waveform.phase_angle_deg, 2);
   Serial.print("° | Phase angle (from PF): ");
@@ -384,7 +399,7 @@ void autoCorrectPFC() {
   
   // Capacitor banks should only be switched in for LAGGING (inductive) loads.
   // For LEADING (capacitive) loads, adding more capacitance worsens the power factor.
-  bool is_lagging = (waveform.phase_type == "LAGGING");
+  bool is_lagging = (waveform.phase_type == LAGGING);
   
   if (!is_lagging || pf_abs >= PF_EXCELLENT_THRESHOLD) {
     // Power factor is already good, or load is capacitive — turn off all capacitors
@@ -410,49 +425,44 @@ void controlRelays() {
 }
 
 // ============= UPDATE I2C LCD =============
-// Line 1: Power factor value + LAGGING / LEADING / IN PHASE
-// Line 2: Active capacitor banks (Relay 1 / Relay 2 / OFF)
+// Overwrites each line in-place (no lcd.clear → no flicker).
+// Line 1: "PF:0.97 LAGGING " — power factor + phase direction
+// Line 2: "5uF R1  12uF R2 " or "Caps: OFF       "
 void updateLCD() {
-  lcd.clear();
+  char line[17];  // 16 visible chars + null terminator
 
-  // --- Line 1: PF and phase direction ---
+  // --- Line 1: PF and phase direction (always fits in 16 chars) ---
+  const char* phase_label;
+  if      (waveform.phase_type == LAGGING)  phase_label = "LAGGING ";
+  else if (waveform.phase_type == LEADING)  phase_label = "LEADING ";
+  else                                       phase_label = "IN PHASE";
+  snprintf(line, sizeof(line), "PF:%.2f %s", fabs(waveform.power_factor), phase_label);
   lcd.setCursor(0, 0);
-  lcd.print("PF:");
-  lcd.print(fabs(waveform.power_factor), 2);
-  lcd.print(" ");
-  if (waveform.phase_type == "LAGGING") {
-    lcd.print("LAGGING");
-  } else if (waveform.phase_type == "LEADING") {
-    lcd.print("LEADING");
-  } else {
-    lcd.print("IN PHASE");
-  }
+  lcd.print(line);
 
-  // --- Line 2: Active capacitor relay(s) ---
-  lcd.setCursor(0, 1);
+  // --- Line 2: Active capacitor relay(s), max 16 chars ---
   if (!relay_control.relay_5uf && !relay_control.relay_12uf) {
-    lcd.print("Caps: OFF       ");
+    snprintf(line, sizeof(line), "Caps: OFF       ");
+  } else if (relay_control.relay_5uf && relay_control.relay_12uf) {
+    snprintf(line, sizeof(line), "5uF R1 + 12uF R2");  // exactly 16
+  } else if (relay_control.relay_5uf) {
+    snprintf(line, sizeof(line), "5uF R1 ON       ");
   } else {
-    lcd.print("Cap:");
-    if (relay_control.relay_5uf)  lcd.print("5uF R1 ");
-    if (relay_control.relay_12uf) lcd.print("12uF R2");
+    snprintf(line, sizeof(line), "12uF R2 ON      ");
   }
+  lcd.setCursor(0, 1);
+  lcd.print(line);
 }
 
 // ============= SEND DATA TO BLYNK =============
 void sendToBlynk() {
-  Blynk.virtualWrite(VPIN_VOLTAGE,      waveform.voltage_rms);
-  Blynk.virtualWrite(VPIN_POWER_FACTOR, fabs(waveform.power_factor));
-  Blynk.virtualWrite(VPIN_PHASE_ANGLE,  waveform.phase_angle_deg);
-
-  // Encode phase type as integer for Blynk label/LED widget
-  int phase_code = 0;  // 0 = IN_PHASE
-  if (waveform.phase_type == "LAGGING") phase_code = 1;
-  else if (waveform.phase_type == "LEADING") phase_code = 2;
-  Blynk.virtualWrite(VPIN_PHASE_TYPE,  phase_code);
-
-  Blynk.virtualWrite(VPIN_RELAY_5UF,  relay_control.relay_5uf  ? 1 : 0);
-  Blynk.virtualWrite(VPIN_RELAY_12UF, relay_control.relay_12uf ? 1 : 0);
+  if (!Blynk.connected()) return;  // Skip if offline — runs fine standalone
+  Blynk.virtualWrite(VPIN_VOLTAGE,       waveform.voltage_rms);
+  Blynk.virtualWrite(VPIN_POWER_FACTOR,  fabs(waveform.power_factor));
+  Blynk.virtualWrite(VPIN_PHASE_ANGLE,   waveform.phase_angle_deg);
+  Blynk.virtualWrite(VPIN_PHASE_TYPE,    (int)waveform.phase_type);  // 0=IN_PHASE 1=LAGGING 2=LEADING
+  Blynk.virtualWrite(VPIN_RELAY_5UF,     relay_control.relay_5uf  ? 1 : 0);
+  Blynk.virtualWrite(VPIN_RELAY_12UF,    relay_control.relay_12uf ? 1 : 0);
 }
 
 
@@ -491,8 +501,10 @@ void printResults() {
   
   Serial.print("Phase Angle: ");
   Serial.print(waveform.phase_angle_deg, 1);
-  Serial.print("° (");
-  Serial.print(waveform.phase_type);
+  Serial.print(" deg (");
+  if      (waveform.phase_type == LAGGING)  Serial.print("LAGGING");
+  else if (waveform.phase_type == LEADING)  Serial.print("LEADING");
+  else                                       Serial.print("IN_PHASE");
   Serial.println(")");
   
   Serial.print("Relays: ");
