@@ -11,9 +11,16 @@
  * IMPORTANT: Both ADC channels use ADC1 so that WiFi/Blynk can run without conflict.
  *   ADC2 (GPIO 4) shares the ESP32 WiFi radio and must NOT be used when WiFi is active.
  *
+ * Confirmed hardware (customer circuit):
+ *   - Voltage sense: 12V AC → 1:9 resistor divider → biased to 1.65V mid-rail → GPIO 36
+ *   - Current sense: CT coil → 330Ω burden resistor → biased to mid-rail → GPIO 34
+ *   - Load: AC fan (inductive)
+ *   - Relay 1: 5µF capacitor bank
+ *   - Relay 2: 12µF capacitor bank
+ *
  * Pin summary:
  *   GPIO 36  - Voltage sense (ADC1_CH0)
- *   GPIO 34  - Current sense (ADC1_CH6)  ← moved from GPIO 4 to avoid WiFi conflict
+ *   GPIO 34  - Current sense (ADC1_CH6)  ← physical wire moved from GPIO 4
  *   GPIO 26  - Relay 1 (5µF capacitor)
  *   GPIO 25  - Relay 2 (12µF capacitor)
  *   GPIO 2   - Status LED
@@ -23,6 +30,17 @@
  * Libraries required (install via Arduino Library Manager):
  *   - LiquidCrystal_I2C  (by Frank de Brabander)
  *   - Blynk              (by Volodymyr Shymanskyy)
+ *
+ * CALIBRATION STEPS (do once, then leave):
+ *   1. Set RAW_DEBUG_MODE 1 below, upload, open Serial Monitor at 115200
+ *      With NO mains connected both channels should idle near 2048.
+ *      If they do not, measure the mid-rail pin voltage with a multimeter
+ *      then calculate: ADC_OFFSET = (V_mid / 3.3) x 4096  and update below.
+ *   2. Connect mains + fan. Voltage RMS on serial should match your mains voltage.
+ *      If it does not: VOLT_RATIO = actual_mains_voltage / displayed_voltage * current_VOLT_RATIO
+ *   3. Current RMS should match a clamp meter reading.
+ *      If it does not: CT_RATIO = actual_amps / displayed_amps * current_CT_RATIO
+ *   4. Set RAW_DEBUG_MODE 0 and re-upload for clean operation.
  */
 
 #define BLYNK_TEMPLATE_ID   "YOUR_TEMPLATE_ID"    // ← replace with your Blynk template ID
@@ -76,10 +94,40 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 #define ADJUSTED_DELAY_US (SAMPLE_INTERVAL_US - 2 * ADC_READ_TIME_US)  // 90µs
 
 // ============= SENSOR CALIBRATION =============
-#define VOLT_RATIO      234.0   // Voltage divider ratio
-#define CT_RATIO         30.0   // CT sensor turns ratio
-#define BURDEN_RESISTOR 100.0   // Burden resistor (Ohms)
-#define ADC_OFFSET      2048    // ADC center point (12-bit: 0-4095)
+// --- HOW TO FIND YOUR VALUES ---
+//
+// VOLT_RATIO:
+//   Formula: (R_top + R_bottom) / R_bottom
+//   Your circuit: 1:9 divider means R_top = 9 * R_bottom → ratio = (9+1)/1 = 10.0
+//   Fine-tune: if Serial shows 210V but your mains is 230V → multiply 10.0 by (230/210) = 10.95
+//
+// CT_RATIO:
+//   Read the label on your CT coil. Examples:
+//     "100A / 50mA"  → ratio = 100 / 0.050 = 2000
+//     "20A / 10mA"   → ratio = 20  / 0.010 = 2000
+//     "SCT-013-030"  → built-in burden, ratio = 30   ← common cheap CT
+//   Fine-tune: if Serial shows 0.30A but clamp meter reads 0.45A → multiply ratio by (0.45/0.30) = 1.5
+//
+// BURDEN_RESISTOR:
+//   The physical resistor across your CT secondary. Confirmed: 330 Ohms.
+//   (If your CT has a built-in burden, set this to 1.0 and fold the burden into CT_RATIO instead.)
+//
+// ADC_OFFSET:
+//   The ADC value when the AC signal is at 0V (the bias mid-point).
+//   Ideal: 2048 (exactly half of 4096). Your circuit biases to 1.65V = 3.3V/2 → offset = 2048.
+//   Fine-tune: upload with RAW_DEBUG_MODE 1, read idle voltage channel ADC value with no mains.
+//             That value IS your ADC_OFFSET. Update and re-upload.
+
+#define VOLT_RATIO      10.0    // 1:9 resistor divider: (R_top+R_bot)/R_bot = (9+1)/1 = 10
+#define CT_RATIO        30.0    // ← UPDATE: read your CT coil label (see formula above)
+#define BURDEN_RESISTOR 330.0   // Confirmed: 330 Ohm burden resistor on CT secondary
+#define ADC_OFFSET      2048    // Mid-rail bias point (1.65V = 3.3V/2 → 4096/2 = 2048)
+
+// ============= RAW DEBUG MODE =============
+// Set to 1 for calibration: prints raw ADC counts + calculated values every loop.
+// Set to 0 for normal operation (less serial noise).
+// See calibration steps in the header comment above.
+#define RAW_DEBUG_MODE  0
 
 // ============= PFC THRESHOLDS =============
 #define PF_EXCELLENT_THRESHOLD 0.95f
@@ -203,7 +251,20 @@ void setup() {
   Serial.println("us (1 full cycle)");
   Serial.print("[SETUP] Full-cycle duration: ");
   Serial.print(FULL_CYCLE_TIME_US / 1000UL);
-  Serial.println("ms\n");
+  Serial.println("ms");
+
+  // Print active calibration values so you can verify them at a glance
+  Serial.println("\n--- CALIBRATION VALUES ---");
+  Serial.print("  VOLT_RATIO:      "); Serial.println(VOLT_RATIO);
+  Serial.print("  CT_RATIO:        "); Serial.println(CT_RATIO);
+  Serial.print("  BURDEN_RESISTOR: "); Serial.print(BURDEN_RESISTOR); Serial.println(" Ohm");
+  Serial.print("  ADC_OFFSET:      "); Serial.println(ADC_OFFSET);
+#if RAW_DEBUG_MODE
+  Serial.println("  RAW_DEBUG_MODE:  ON  (set to 0 for clean operation)");
+#else
+  Serial.println("  RAW_DEBUG_MODE:  OFF");
+#endif
+  Serial.println("--------------------------\n");
 }
 
 // ============= MAIN LOOP =============
@@ -269,6 +330,19 @@ void captureFullCycle() {
   Serial.print("[CAPTURE] Complete in ");
   Serial.print(total_time);
   Serial.println("us");
+
+#if RAW_DEBUG_MODE
+  // Print the first 5 raw ADC samples so you can check the idle offset
+  Serial.println("[RAW] First 5 samples (voltage_adc, current_adc):");
+  for (uint8_t d = 0; d < 5; d++) {
+    Serial.print("  [");
+    Serial.print(d);
+    Serial.print("] V=");
+    Serial.print(waveform.samples[d].raw_voltage);
+    Serial.print("  I=");
+    Serial.println(waveform.samples[d].raw_current);
+  }
+#endif
 }
 
 // ============= FIND PEAK VOLTAGE AND CURRENT =============
