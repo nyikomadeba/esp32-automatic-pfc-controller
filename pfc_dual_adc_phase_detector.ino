@@ -97,9 +97,20 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 // --- HOW TO FIND YOUR VALUES ---
 //
 // VOLT_RATIO:
-//   Formula: (R_top + R_bottom) / R_bottom
-//   Your circuit: 1:9 divider means R_top = 9 * R_bottom → ratio = (9+1)/1 = 10.0
-//   Fine-tune: if Serial shows 210V but your mains is 230V → multiply 10.0 by (230/210) = 10.95
+//   This is the total scaling factor from mains voltage down to the ADC pin.
+//   It is the product of the transformer ratio AND the resistor divider ratio.
+//
+//   Your hardware chain:
+//     Mains (225V AC)
+//       → Transformer (225V : 12.5V)   ratio = 225 / 12.5 = 18
+//       → Resistor divider (9kΩ top, 1kΩ bottom, ADC reads across 1kΩ)
+//                                       ratio = (9k + 1k) / 1k = 10
+//       → ADC pin
+//
+//   VOLT_RATIO = transformer_ratio × divider_ratio = 18 × 10 = 180
+//
+//   Fine-tune: if Serial shows 210V but your mains is 225V:
+//     new VOLT_RATIO = 180 × (210 / 225) = 168  (lower ratio → higher displayed voltage)
 //
 // CT_RATIO:
 //   Read the label on your CT coil. Examples:
@@ -118,7 +129,7 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 //   Fine-tune: upload with RAW_DEBUG_MODE 1, read idle voltage channel ADC value with no mains.
 //             That value IS your ADC_OFFSET. Update and re-upload.
 
-#define VOLT_RATIO      10.0    // 1:9 resistor divider: (R_top+R_bot)/R_bot = (9+1)/1 = 10
+#define VOLT_RATIO      180.0   // 225V mains ÷ 18:1 transformer ÷ 10:1 divider (9kΩ/1kΩ) = 180
 #define CT_RATIO        30.0    // ← UPDATE: read your CT coil label (see formula above)
 #define BURDEN_RESISTOR 330.0   // Confirmed: 330 Ohm burden resistor on CT secondary
 #define ADC_OFFSET      2048    // Mid-rail bias point (1.65V = 3.3V/2 → 4096/2 = 2048)
