@@ -4,26 +4,71 @@
  * Calculates phase difference to determine leading/lagging
  * Computes power factor for automatic PFC correction
  *
- * NOTE: ADC2 (GPIO 4) is shared with the ESP32 WiFi radio.
- *       Do NOT enable WiFi in this sketch; doing so will cause
- *       ADC2 reads to fail and return -1, breaking current measurement.
+ * Features:
+ *   - I2C LCD display: power factor, phase status, voltage, active capacitors
+ *   - Blynk IoT app: streams PF, phase angle, and voltage in real-time
+ *
+ * IMPORTANT: Both ADC channels use ADC1 so that WiFi/Blynk can run without conflict.
+ *   ADC2 (GPIO 4) shares the ESP32 WiFi radio and must NOT be used when WiFi is active.
+ *
+ * Pin summary:
+ *   GPIO 36  - Voltage sense (ADC1_CH0)
+ *   GPIO 34  - Current sense (ADC1_CH6)  ← moved from GPIO 4 to avoid WiFi conflict
+ *   GPIO 26  - Relay 1 (5µF capacitor)
+ *   GPIO 25  - Relay 2 (12µF capacitor)
+ *   GPIO 2   - Status LED
+ *   GPIO 21  - I2C SDA (LCD)
+ *   GPIO 22  - I2C SCL (LCD)
+ *
+ * Libraries required (install via Arduino Library Manager):
+ *   - LiquidCrystal_I2C  (by Frank de Brabander)
+ *   - Blynk              (by Volodymyr Shymanskyy)
  */
+
+#define BLYNK_TEMPLATE_ID   "YOUR_TEMPLATE_ID"    // ← replace with your Blynk template ID
+#define BLYNK_TEMPLATE_NAME "PFC Controller"
+#define BLYNK_AUTH_TOKEN    "YOUR_AUTH_TOKEN"      // ← replace with your Blynk auth token
 
 #include <Arduino.h>
 #include <cmath>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+// ============= WIFI CREDENTIALS =============
+const char* WIFI_SSID = "YOUR_WIFI_SSID";         // ← replace with your WiFi network name
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";      // ← replace with your WiFi password
+
+// ============= BLYNK VIRTUAL PIN MAPPING =============
+// Configure matching widgets in the Blynk app (Gauge or Value Display):
+#define VPIN_VOLTAGE     V0   // Voltage RMS (V)
+#define VPIN_POWER_FACTOR V1  // Power Factor (0.00 – 1.00)
+#define VPIN_PHASE_ANGLE V2   // Phase Angle (degrees)
+#define VPIN_PHASE_TYPE  V3   // Phase type: 0 = IN_PHASE, 1 = LAGGING, 2 = LEADING
+#define VPIN_RELAY_5UF   V4   // Relay 1 state (0/1)
+#define VPIN_RELAY_12UF  V5   // Relay 2 state (0/1)
 
 // ============= PIN CONFIGURATION =============
-#define VOLT_PIN_ADC1 36    // ADC1_CH0 (GPIO 36) - Voltage
-#define CURR_PIN_ADC2 4     // ADC2_CH0 (GPIO 4)  - Current (see WiFi warning above)
-#define RELAY_5UF_PIN 26    // Relay 1 (5µF)
+#define VOLT_PIN_ADC1  36   // ADC1_CH0 (GPIO 36) - Voltage
+#define CURR_PIN_ADC1  34   // ADC1_CH6 (GPIO 34) - Current (ADC1 only — safe with WiFi)
+#define RELAY_5UF_PIN  26   // Relay 1 (5µF)
 #define RELAY_12UF_PIN 25   // Relay 2 (12µF)
-#define LED_PIN 2           // Status LED
+#define LED_PIN         2   // Status LED
+// LCD uses default I2C bus: SDA = GPIO 21, SCL = GPIO 22
+
+// ============= I2C LCD =============
+// Common I2C address is 0x27; try 0x3F if display is blank
+#define LCD_I2C_ADDR 0x27
+#define LCD_COLS     16
+#define LCD_ROWS      2
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 
 // ============= SAMPLING CONFIGURATION =============
-#define AC_FREQUENCY 50                                      // 50Hz or 60Hz
-#define FULL_CYCLE_TIME_US (1000000UL / AC_FREQUENCY)        // 20000µs for 50Hz
-#define SAMPLE_INTERVAL_US 100UL                             // Sample every 100µs
-#define TOTAL_SAMPLES (FULL_CYCLE_TIME_US / SAMPLE_INTERVAL_US)  // 200 samples per full cycle
+#define AC_FREQUENCY 50                                           // 50Hz or 60Hz
+#define FULL_CYCLE_TIME_US (1000000UL / AC_FREQUENCY)             // 20000µs for 50Hz
+#define SAMPLE_INTERVAL_US 100UL                                  // Sample every 100µs
+#define TOTAL_SAMPLES (FULL_CYCLE_TIME_US / SAMPLE_INTERVAL_US)   // 200 samples per full cycle
 
 // Approximate ADC read time per channel (µs). Measured ~5µs on ESP32 @ 80MHz.
 // Two reads per iteration, so subtract 2x from the delay to keep intervals accurate.
@@ -31,15 +76,19 @@
 #define ADJUSTED_DELAY_US (SAMPLE_INTERVAL_US - 2 * ADC_READ_TIME_US)  // 90µs
 
 // ============= SENSOR CALIBRATION =============
-#define VOLT_RATIO 234.0        // Voltage divider ratio
-#define CT_RATIO 30.0           // CT sensor turns ratio
+#define VOLT_RATIO      234.0   // Voltage divider ratio
+#define CT_RATIO         30.0   // CT sensor turns ratio
 #define BURDEN_RESISTOR 100.0   // Burden resistor (Ohms)
-#define ADC_OFFSET 2048         // ADC center point (12-bit: 0-4095)
+#define ADC_OFFSET      2048    // ADC center point (12-bit: 0-4095)
 
 // ============= PFC THRESHOLDS =============
 #define PF_EXCELLENT_THRESHOLD 0.95f
-#define PF_GOOD_THRESHOLD 0.90f
+#define PF_GOOD_THRESHOLD      0.90f
 #define PF_ACCEPTABLE_THRESHOLD 0.85f
+
+// ============= BLYNK UPDATE INTERVAL =============
+// Blynk is updated every N loop iterations to avoid flooding the server
+#define BLYNK_UPDATE_EVERY_N 5
 
 // ============= DATA STRUCTURES =============
 struct Sample {
@@ -73,6 +122,7 @@ struct RelayControl {
 // ============= GLOBAL VARIABLES =============
 WaveformData waveform;
 RelayControl relay_control;
+uint8_t blynk_loop_counter = 0;
 
 // ============= FUNCTION DECLARATIONS =============
 void captureFullCycle();
@@ -81,6 +131,8 @@ void calculatePowerMetrics();
 void detectPhase();
 void autoCorrectPFC();
 void controlRelays();
+void updateLCD();
+void sendToBlynk();
 void printResults();
 
 // ============= SETUP =============
@@ -91,31 +143,49 @@ void setup() {
   Serial.println("\n\n========================================");
   Serial.println("   ESP32 Dual ADC PFC Phase Detector");
   Serial.println("========================================\n");
-  
-  // Initialize ADC pins
+
+  // ----- I2C LCD -----
+  Wire.begin();  // SDA = GPIO 21, SCL = GPIO 22 (ESP32 defaults)
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("PFC Controller");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+
+  // ----- ADC -----
   pinMode(VOLT_PIN_ADC1, INPUT);
-  pinMode(CURR_PIN_ADC2, INPUT);
-  
-  // Set ADC resolution to 12-bit and full-range attenuation (0–3.3V)
+  pinMode(CURR_PIN_ADC1, INPUT);
   analogReadResolution(12);
   analogSetPinAttenuation(VOLT_PIN_ADC1, ADC_11db);
-  analogSetPinAttenuation(CURR_PIN_ADC2, ADC_11db);
-  
-  // Initialize relay pins (LOW = relay off)
+  analogSetPinAttenuation(CURR_PIN_ADC1, ADC_11db);
+
+  // ----- Relays & LED -----
   pinMode(RELAY_5UF_PIN, OUTPUT);
   pinMode(RELAY_12UF_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
-  
   digitalWrite(RELAY_5UF_PIN, LOW);
   digitalWrite(RELAY_12UF_PIN, LOW);
   digitalWrite(LED_PIN, LOW);
-  
+
+  // ----- WiFi + Blynk -----
+  Serial.print("[SETUP] Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  lcd.setCursor(0, 1);
+  lcd.print("WiFi connect... ");
+  Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
+  Serial.println("[SETUP] WiFi + Blynk connected");
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("PFC Ready!");
+
   Serial.println("[SETUP] ADC configuration complete");
   Serial.print("[SETUP] Capturing ");
   Serial.print(TOTAL_SAMPLES);
   Serial.print(" samples every ");
   Serial.print(SAMPLE_INTERVAL_US);
-  Serial.println("µs (1 full cycle)");
+  Serial.println("us (1 full cycle)");
   Serial.print("[SETUP] Full-cycle duration: ");
   Serial.print(FULL_CYCLE_TIME_US / 1000UL);
   Serial.println("ms\n");
@@ -123,6 +193,8 @@ void setup() {
 
 // ============= MAIN LOOP =============
 void loop() {
+  Blynk.run();  // Keep Blynk connection alive
+
   // Capture one complete full cycle with simultaneous dual ADC reads
   captureFullCycle();
   
@@ -140,8 +212,18 @@ void loop() {
     autoCorrectPFC();
   }
   controlRelays();
-  
-  // Display results
+
+  // Update I2C LCD with priority display
+  updateLCD();
+
+  // Send data to Blynk every N iterations
+  blynk_loop_counter++;
+  if (blynk_loop_counter >= BLYNK_UPDATE_EVERY_N) {
+    blynk_loop_counter = 0;
+    sendToBlynk();
+  }
+
+  // Display results on serial monitor
   printResults();
   
   delay(500);
@@ -154,9 +236,9 @@ void captureFullCycle() {
   unsigned long start_time = micros();
   
   for (uint16_t i = 0; i < TOTAL_SAMPLES; i++) {
-    // Read both ADCs back-to-back; delay between reads is <10µs (negligible vs 100µs interval)
+    // Read both ADC1 channels back-to-back (both on ADC1 — WiFi-safe)
     waveform.samples[i].raw_voltage = analogRead(VOLT_PIN_ADC1);
-    waveform.samples[i].raw_current = analogRead(CURR_PIN_ADC2);
+    waveform.samples[i].raw_current = analogRead(CURR_PIN_ADC1);
     
     // Record timestamp relative to capture start
     waveform.samples[i].timestamp_us = micros() - start_time;
@@ -171,7 +253,7 @@ void captureFullCycle() {
   unsigned long total_time = micros() - start_time;
   Serial.print("[CAPTURE] Complete in ");
   Serial.print(total_time);
-  Serial.println("µs");
+  Serial.println("us");
 }
 
 // ============= FIND PEAK VOLTAGE AND CURRENT =============
@@ -327,7 +409,53 @@ void controlRelays() {
   digitalWrite(RELAY_12UF_PIN, relay_control.relay_12uf ? HIGH : LOW);
 }
 
-// ============= PRINT RESULTS =============
+// ============= UPDATE I2C LCD =============
+// Line 1: Power factor value + LAGGING / LEADING / IN PHASE
+// Line 2: Active capacitor banks (Relay 1 / Relay 2 / OFF)
+void updateLCD() {
+  lcd.clear();
+
+  // --- Line 1: PF and phase direction ---
+  lcd.setCursor(0, 0);
+  lcd.print("PF:");
+  lcd.print(fabs(waveform.power_factor), 2);
+  lcd.print(" ");
+  if (waveform.phase_type == "LAGGING") {
+    lcd.print("LAGGING");
+  } else if (waveform.phase_type == "LEADING") {
+    lcd.print("LEADING");
+  } else {
+    lcd.print("IN PHASE");
+  }
+
+  // --- Line 2: Active capacitor relay(s) ---
+  lcd.setCursor(0, 1);
+  if (!relay_control.relay_5uf && !relay_control.relay_12uf) {
+    lcd.print("Caps: OFF       ");
+  } else {
+    lcd.print("Cap:");
+    if (relay_control.relay_5uf)  lcd.print("5uF R1 ");
+    if (relay_control.relay_12uf) lcd.print("12uF R2");
+  }
+}
+
+// ============= SEND DATA TO BLYNK =============
+void sendToBlynk() {
+  Blynk.virtualWrite(VPIN_VOLTAGE,      waveform.voltage_rms);
+  Blynk.virtualWrite(VPIN_POWER_FACTOR, fabs(waveform.power_factor));
+  Blynk.virtualWrite(VPIN_PHASE_ANGLE,  waveform.phase_angle_deg);
+
+  // Encode phase type as integer for Blynk label/LED widget
+  int phase_code = 0;  // 0 = IN_PHASE
+  if (waveform.phase_type == "LAGGING") phase_code = 1;
+  else if (waveform.phase_type == "LEADING") phase_code = 2;
+  Blynk.virtualWrite(VPIN_PHASE_TYPE,  phase_code);
+
+  Blynk.virtualWrite(VPIN_RELAY_5UF,  relay_control.relay_5uf  ? 1 : 0);
+  Blynk.virtualWrite(VPIN_RELAY_12UF, relay_control.relay_12uf ? 1 : 0);
+}
+
+
 void printResults() {
   Serial.println("\n========== POWER FACTOR ANALYSIS ==========");
   Serial.print("Voltage RMS: ");
