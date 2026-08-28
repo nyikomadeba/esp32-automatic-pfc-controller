@@ -1,8 +1,12 @@
 /*
  * ESP32 Dual ADC Simultaneous Sampling with Phase Detection
- * Captures one half-wave (10ms @ 50Hz) with timestamps
+ * Captures one full cycle (20ms @ 50Hz) with timestamps
  * Calculates phase difference to determine leading/lagging
  * Computes power factor for automatic PFC correction
+ *
+ * NOTE: ADC2 (GPIO 4) is shared with the ESP32 WiFi radio.
+ *       Do NOT enable WiFi in this sketch; doing so will cause
+ *       ADC2 reads to fail and return -1, breaking current measurement.
  */
 
 #include <Arduino.h>
@@ -10,16 +14,21 @@
 
 // ============= PIN CONFIGURATION =============
 #define VOLT_PIN_ADC1 36    // ADC1_CH0 (GPIO 36) - Voltage
-#define CURR_PIN_ADC2 4     // ADC2_CH0 (GPIO 4)  - Current
+#define CURR_PIN_ADC2 4     // ADC2_CH0 (GPIO 4)  - Current (see WiFi warning above)
 #define RELAY_5UF_PIN 26    // Relay 1 (5µF)
 #define RELAY_12UF_PIN 25   // Relay 2 (12µF)
 #define LED_PIN 2           // Status LED
 
 // ============= SAMPLING CONFIGURATION =============
-#define AC_FREQUENCY 50                          // 50Hz or 60Hz
-#define HALF_WAVE_TIME_MS (1000 / (AC_FREQUENCY * 2))  // 10ms for 50Hz
-#define SAMPLE_INTERVAL_US 50                    // Sample every 50µs
-#define TOTAL_SAMPLES (HALF_WAVE_TIME_MS * 1000 / SAMPLE_INTERVAL_US)  // 200 samples
+#define AC_FREQUENCY 50                                      // 50Hz or 60Hz
+#define FULL_CYCLE_TIME_US (1000000UL / AC_FREQUENCY)        // 20000µs for 50Hz
+#define SAMPLE_INTERVAL_US 100UL                             // Sample every 100µs
+#define TOTAL_SAMPLES (FULL_CYCLE_TIME_US / SAMPLE_INTERVAL_US)  // 200 samples per full cycle
+
+// Approximate ADC read time per channel (µs). Measured ~5µs on ESP32 @ 80MHz.
+// Two reads per iteration, so subtract 2x from the delay to keep intervals accurate.
+#define ADC_READ_TIME_US 5UL
+#define ADJUSTED_DELAY_US (SAMPLE_INTERVAL_US - 2 * ADC_READ_TIME_US)  // 90µs
 
 // ============= SENSOR CALIBRATION =============
 #define VOLT_RATIO 234.0        // Voltage divider ratio
@@ -28,16 +37,16 @@
 #define ADC_OFFSET 2048         // ADC center point (12-bit: 0-4095)
 
 // ============= PFC THRESHOLDS =============
-#define PF_EXCELLENT_THRESHOLD 0.95
-#define PF_GOOD_THRESHOLD 0.90
-#define PF_ACCEPTABLE_THRESHOLD 0.85
+#define PF_EXCELLENT_THRESHOLD 0.95f
+#define PF_GOOD_THRESHOLD 0.90f
+#define PF_ACCEPTABLE_THRESHOLD 0.85f
 
 // ============= DATA STRUCTURES =============
 struct Sample {
   uint16_t raw_voltage;
   uint16_t raw_current;
-  uint32_t timestamp_us;  // Microseconds
-  uint16_t sample_index;  // Position in array (0-199)
+  uint32_t timestamp_us;  // Microseconds since capture start
+  uint16_t sample_index;  // Position in array (0 to TOTAL_SAMPLES-1)
 };
 
 struct WaveformData {
@@ -66,10 +75,11 @@ WaveformData waveform;
 RelayControl relay_control;
 
 // ============= FUNCTION DECLARATIONS =============
-void captureHalfWave();
+void captureFullCycle();
 void findPeaks();
 void calculatePowerMetrics();
 void detectPhase();
+void autoCorrectPFC();
 void controlRelays();
 void printResults();
 
@@ -86,11 +96,12 @@ void setup() {
   pinMode(VOLT_PIN_ADC1, INPUT);
   pinMode(CURR_PIN_ADC2, INPUT);
   
-  // Set ADC attenuation for full range
+  // Set ADC resolution to 12-bit and full-range attenuation (0–3.3V)
+  analogReadResolution(12);
   analogSetPinAttenuation(VOLT_PIN_ADC1, ADC_11db);
   analogSetPinAttenuation(CURR_PIN_ADC2, ADC_11db);
   
-  // Initialize relay pins
+  // Initialize relay pins (LOW = relay off)
   pinMode(RELAY_5UF_PIN, OUTPUT);
   pinMode(RELAY_12UF_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
@@ -104,16 +115,16 @@ void setup() {
   Serial.print(TOTAL_SAMPLES);
   Serial.print(" samples every ");
   Serial.print(SAMPLE_INTERVAL_US);
-  Serial.println("µs");
-  Serial.print("[SETUP] Half-wave duration: ");
-  Serial.print(HALF_WAVE_TIME_MS);
+  Serial.println("µs (1 full cycle)");
+  Serial.print("[SETUP] Full-cycle duration: ");
+  Serial.print(FULL_CYCLE_TIME_US / 1000UL);
   Serial.println("ms\n");
 }
 
 // ============= MAIN LOOP =============
 void loop() {
-  // Capture one complete half-wave with simultaneous dual ADC reads
-  captureHalfWave();
+  // Capture one complete full cycle with simultaneous dual ADC reads
+  captureFullCycle();
   
   // Find peak voltage and current values and their positions
   findPeaks();
@@ -124,7 +135,7 @@ void loop() {
   // Detect phase relationship using peak positions
   detectPhase();
   
-  // Control relays based on power factor
+  // Control relays based on power factor and phase type
   if (relay_control.auto_mode) {
     autoCorrectPFC();
   }
@@ -136,17 +147,14 @@ void loop() {
   delay(500);
 }
 
-// ============= CAPTURE ONE HALF-WAVE =============
-void captureHalfWave() {
-  Serial.println("[CAPTURE] Starting simultaneous dual-ADC capture...");
+// ============= CAPTURE ONE FULL CYCLE =============
+void captureFullCycle() {
+  Serial.println("[CAPTURE] Starting simultaneous dual-ADC capture (full cycle)...");
   
   unsigned long start_time = micros();
   
   for (uint16_t i = 0; i < TOTAL_SAMPLES; i++) {
-    // Read BOTH ADCs simultaneously
-    // ADC1 (GPIO 36) and ADC2 (GPIO 4) operate independently
-    // Delay between reads: <500 nanoseconds (negligible)
-    
+    // Read both ADCs back-to-back; delay between reads is <10µs (negligible vs 100µs interval)
     waveform.samples[i].raw_voltage = analogRead(VOLT_PIN_ADC1);
     waveform.samples[i].raw_current = analogRead(CURR_PIN_ADC2);
     
@@ -154,8 +162,10 @@ void captureHalfWave() {
     waveform.samples[i].timestamp_us = micros() - start_time;
     waveform.samples[i].sample_index = i;
     
-    // Wait for next sample interval
-    delayMicroseconds(SAMPLE_INTERVAL_US);
+    // Wait for next sample interval, compensating for ADC read time
+    if (ADJUSTED_DELAY_US > 0) {
+      delayMicroseconds(ADJUSTED_DELAY_US);
+    }
   }
   
   unsigned long total_time = micros() - start_time;
@@ -171,9 +181,11 @@ void findPeaks() {
   waveform.peak_volt_index = 0;
   waveform.peak_curr_index = 0;
   
-  // Find the highest voltage reading
+  // Find the highest voltage reading.
+  // Cast to int16_t before taking abs() to avoid unsigned underflow
+  // when raw ADC value is below ADC_OFFSET.
   for (uint16_t i = 0; i < TOTAL_SAMPLES; i++) {
-    uint16_t centered_volt = abs(waveform.samples[i].raw_voltage - ADC_OFFSET);
+    uint16_t centered_volt = (uint16_t)abs((int16_t)waveform.samples[i].raw_voltage - (int16_t)ADC_OFFSET);
     if (centered_volt > peak_volt) {
       peak_volt = centered_volt;
       waveform.peak_volt_index = i;
@@ -181,9 +193,9 @@ void findPeaks() {
     }
   }
   
-  // Find the highest current reading
+  // Find the highest current reading (same signed-subtraction fix)
   for (uint16_t i = 0; i < TOTAL_SAMPLES; i++) {
-    uint16_t centered_curr = abs(waveform.samples[i].raw_current - ADC_OFFSET);
+    uint16_t centered_curr = (uint16_t)abs((int16_t)waveform.samples[i].raw_current - (int16_t)ADC_OFFSET);
     if (centered_curr > peak_curr) {
       peak_curr = centered_curr;
       waveform.peak_curr_index = i;
@@ -240,21 +252,22 @@ void calculatePowerMetrics() {
 // ============= DETECT PHASE (LEADING vs LAGGING) =============
 void detectPhase() {
   // Phase angle difference = (index difference / total samples) * 360°
-  // But for AC: one full cycle = 360°, half-wave = 180°
+  // One full cycle = 360°
   
-  int index_diff = waveform.peak_curr_index - waveform.peak_volt_index;
+  int index_diff = (int)waveform.peak_curr_index - (int)waveform.peak_volt_index;
   
-  // Convert index difference to time difference
-  uint32_t time_diff_us = abs((int)waveform.samples[waveform.peak_curr_index].timestamp_us - 
-                               (int)waveform.samples[waveform.peak_volt_index].timestamp_us);
+  // Convert index difference to time difference using signed arithmetic
+  int32_t time_diff_signed = (int32_t)waveform.samples[waveform.peak_curr_index].timestamp_us -
+                              (int32_t)waveform.samples[waveform.peak_volt_index].timestamp_us;
+  uint32_t time_diff_us = (uint32_t)abs(time_diff_signed);
   
-  // Time for half-wave (180°)
-  uint32_t half_wave_time_us = HALF_WAVE_TIME_MS * 1000;
+  // Full cycle time in µs
+  uint32_t full_cycle_time_us = FULL_CYCLE_TIME_US;
   
-  // Calculate phase angle: (time_diff / half_wave_time) * 180°
-  waveform.phase_angle_deg = (float)time_diff_us / half_wave_time_us * 180.0;
+  // Calculate phase angle: (time_diff / full_cycle_time) * 360°
+  waveform.phase_angle_deg = (float)time_diff_us / (float)full_cycle_time_us * 360.0f;
   
-  // Determine if leading or lagging
+  // Determine if leading or lagging based on peak index order
   if (index_diff > 0) {
     waveform.phase_type = "LAGGING";  // Current peaks AFTER voltage
   } else if (index_diff < 0) {
@@ -263,13 +276,13 @@ void detectPhase() {
     waveform.phase_type = "IN_PHASE"; // Peaks aligned
   }
   
-  // Verify with real power sign
+  // Cross-check: if calculated real power is negative, load is capacitive (leading)
   if (waveform.real_power < 0) {
-    waveform.phase_type = "LEADING";  // Negative power = capacitive
+    waveform.phase_type = "LEADING";
   }
   
-  // Also calculate using arccos of PF
-  float pf_angle = acos(fabs(waveform.power_factor)) * 180.0 / M_PI;
+  // Phase angle from arccos of |PF| for reference
+  float pf_angle = acos(fabs(waveform.power_factor)) * 180.0f / (float)M_PI;
   
   Serial.print("[PHASE] Index difference: ");
   Serial.print(index_diff);
@@ -287,19 +300,22 @@ void detectPhase() {
 void autoCorrectPFC() {
   float pf_abs = fabs(waveform.power_factor);
   
-  if (pf_abs >= PF_EXCELLENT_THRESHOLD) {
+  // Capacitor banks should only be switched in for LAGGING (inductive) loads.
+  // For LEADING (capacitive) loads, adding more capacitance worsens the power factor.
+  bool is_lagging = (waveform.phase_type == "LAGGING");
+  
+  if (!is_lagging || pf_abs >= PF_EXCELLENT_THRESHOLD) {
+    // Power factor is already good, or load is capacitive — turn off all capacitors
     relay_control.relay_5uf = false;
     relay_control.relay_12uf = false;
   }
   else if (pf_abs >= PF_GOOD_THRESHOLD) {
+    // Mild lagging: 5µF correction only
     relay_control.relay_5uf = true;
     relay_control.relay_12uf = false;
   }
-  else if (pf_abs >= PF_ACCEPTABLE_THRESHOLD) {
-    relay_control.relay_5uf = true;
-    relay_control.relay_12uf = true;
-  }
   else {
+    // PF < 0.90 (GOOD) threshold: use both capacitor banks for maximum correction
     relay_control.relay_5uf = true;
     relay_control.relay_12uf = true;
   }
@@ -352,8 +368,12 @@ void printResults() {
   Serial.println(")");
   
   Serial.print("Relays: ");
-  Serial.print(relay_control.relay_5uf ? "5µF " : "");
-  Serial.print(relay_control.relay_12uf ? "12µF " : "OFF");
+  if (!relay_control.relay_5uf && !relay_control.relay_12uf) {
+    Serial.print("OFF");
+  } else {
+    if (relay_control.relay_5uf)  Serial.print("5µF ");
+    if (relay_control.relay_12uf) Serial.print("12µF");
+  }
   Serial.println();
   
   Serial.println("=========================================\n");
