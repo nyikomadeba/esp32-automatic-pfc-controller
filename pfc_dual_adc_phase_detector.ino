@@ -315,7 +315,7 @@ void autoCorrectPFC() {
     relay_control.relay_12uf = false;
   }
   else {
-    // PF < 0.90 (GOOD) threshold: use both capacitor banks for maximum correction
+    // PF is below GOOD threshold (< 0.90) — use both capacitor banks for maximum correction
     relay_control.relay_5uf = true;
     relay_control.relay_12uf = true;
   }
